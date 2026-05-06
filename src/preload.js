@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('vpnAPI', {
   disconnect: (serverId) => ipcRenderer.invoke('vpn:disconnect', serverId),
   getStatus: () => ipcRenderer.invoke('vpn:status'),
   checkWireGuard: () => ipcRenderer.invoke('vpn:check-wireguard'),
+  setupWireGuard: () => ipcRenderer.invoke('vpn:setup-wireguard'),
   minimize: () => ipcRenderer.invoke('app:minimize'),
   close: () => ipcRenderer.invoke('app:close'),
   getPlatform: () => ipcRenderer.invoke('app:platform')

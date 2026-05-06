@@ -1,19 +1,19 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, spawn } = require('child_process');
 const fs = require('fs');
-const os = require('os');
+const https = require('https');
+const http = require('http');
 
 let mainWindow;
-let tray;
-let vpnProcess = null;
 let isConnected = false;
 let currentConfigPath = null;
+let currentTunnelName = null;
 
 const isWin = process.platform === 'win32';
 const isMac = process.platform === 'darwin';
 
-function getWgQuickPath() {
+function getWgPath() {
   if (isWin) {
     const paths = [
       'C:\\Program Files\\WireGuard\\wireguard.exe',
@@ -22,16 +22,22 @@ function getWgQuickPath() {
     for (const p of paths) {
       if (fs.existsSync(p)) return p;
     }
-    return 'wireguard';
+    return null;
   }
-  if (isMac) {
-    const paths = ['/usr/local/bin/wg-quick', '/opt/homebrew/bin/wg-quick', '/usr/bin/wg-quick'];
-    for (const p of paths) {
-      if (fs.existsSync(p)) return p;
-    }
+  const paths = ['/usr/local/bin/wg-quick', '/opt/homebrew/bin/wg-quick', '/usr/bin/wg-quick'];
+  for (const p of paths) {
+    if (fs.existsSync(p)) return p;
+  }
+  try {
+    execSync('which wg-quick', { stdio: 'ignore' });
     return 'wg-quick';
+  } catch {
+    return null;
   }
-  return 'wg-quick';
+}
+
+function isWireGuardInstalled() {
+  return getWgPath() !== null;
 }
 
 function getConfigDir() {
@@ -41,17 +47,90 @@ function getConfigDir() {
 }
 
 function writeConfig(serverId, config) {
-  const configDir = getConfigDir();
-  const configPath = path.join(configDir, `${serverId}.conf`);
+  const configPath = path.join(getConfigDir(), `${serverId}.conf`);
   fs.writeFileSync(configPath, config, { mode: 0o600 });
   return configPath;
+}
+
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(dest);
+    protocol.get(url, (response) => {
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        downloadFile(response.headers.location, dest).then(resolve).catch(reject);
+        return;
+      }
+      response.pipe(file);
+      file.on('finish', () => { file.close(); resolve(); });
+    }).on('error', (err) => {
+      fs.unlink(dest, () => {});
+      reject(err);
+    });
+  });
+}
+
+async function installWireGuardWindows() {
+  const msiUrl = 'https://download.wireguard.com/windows-client/wireguard-installer.exe';
+  const installerPath = path.join(app.getPath('temp'), 'wireguard-installer.exe');
+
+  await downloadFile(msiUrl, installerPath);
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(installerPath, [], { stdio: 'ignore' });
+    proc.on('close', (code) => {
+      try { fs.unlinkSync(installerPath); } catch {}
+      if (isWireGuardInstalled()) {
+        resolve(true);
+      } else {
+        reject(new Error('WireGuard installation was cancelled or failed'));
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+
+async function installWireGuardMac() {
+  return new Promise((resolve, reject) => {
+    const sudo = require('sudo-prompt');
+    const brewCheck = 'which brew';
+    exec(brewCheck, (err) => {
+      if (err) {
+        shell.openExternal('https://www.wireguard.com/install/');
+        reject(new Error('Please install Homebrew first, then restart the app'));
+        return;
+      }
+      sudo.exec('brew install wireguard-tools', { name: 'XynthraVPN Setup' }, (err2) => {
+        if (err2) {
+          shell.openExternal('https://www.wireguard.com/install/');
+          reject(new Error('Auto-install failed. Please install WireGuard manually.'));
+          return;
+        }
+        resolve(true);
+      });
+    });
+  });
+}
+
+async function ensureWireGuard() {
+  if (isWireGuardInstalled()) return { installed: true };
+
+  try {
+    if (isWin) {
+      await installWireGuardWindows();
+    } else if (isMac) {
+      await installWireGuardMac();
+    }
+    return { installed: true };
+  } catch (err) {
+    return { installed: false, error: err.message };
+  }
 }
 
 function runElevated(command) {
   return new Promise((resolve, reject) => {
     if (isWin) {
-      const psCommand = `Start-Process cmd -ArgumentList '/c ${command.replace(/'/g, "''")}' -Verb RunAs -Wait`;
-      exec(`powershell -Command "${psCommand}"`, (err, stdout, stderr) => {
+      exec(command, { timeout: 30000 }, (err, stdout, stderr) => {
         if (err) reject(err);
         else resolve(stdout);
       });
@@ -68,12 +147,18 @@ function runElevated(command) {
 async function connectVPN(serverId, config) {
   const configPath = writeConfig(serverId, config);
   currentConfigPath = configPath;
+  currentTunnelName = serverId;
 
   try {
     if (isWin) {
-      await runElevated(`"${getWgQuickPath()}" /installtunnelservice "${configPath}"`);
+      const wgPath = getWgPath();
+      if (!wgPath) throw new Error('WireGuard not found');
+      const cmd = `"${wgPath}" /installtunnelservice "${configPath}"`;
+      await runElevated(cmd);
     } else {
-      await runElevated(`${getWgQuickPath()} up "${configPath}"`);
+      const wgPath = getWgPath();
+      if (!wgPath) throw new Error('wg-quick not found');
+      await runElevated(`${wgPath} up "${configPath}"`);
     }
     isConnected = true;
     return { success: true };
@@ -85,30 +170,20 @@ async function connectVPN(serverId, config) {
 async function disconnectVPN(serverId) {
   try {
     if (isWin) {
-      const configPath = currentConfigPath || path.join(getConfigDir(), `${serverId}.conf`);
-      await runElevated(`"${getWgQuickPath()}" /uninstalltunnelservice "${path.basename(configPath, '.conf')}"`);
+      const wgPath = getWgPath();
+      const tunnelName = currentTunnelName || serverId;
+      await runElevated(`"${wgPath}" /uninstalltunnelservice "${tunnelName}"`);
     } else {
+      const wgPath = getWgPath();
       const configPath = currentConfigPath || path.join(getConfigDir(), `${serverId}.conf`);
-      await runElevated(`${getWgQuickPath()} down "${configPath}"`);
+      await runElevated(`${wgPath} down "${configPath}"`);
     }
     isConnected = false;
     currentConfigPath = null;
+    currentTunnelName = null;
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
-  }
-}
-
-function checkWireGuardInstalled() {
-  try {
-    if (isWin) {
-      return fs.existsSync('C:\\Program Files\\WireGuard\\wireguard.exe') ||
-             fs.existsSync('C:\\Program Files (x86)\\WireGuard\\wireguard.exe');
-    }
-    execSync('which wg-quick', { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -146,6 +221,10 @@ app.whenReady().then(() => {
   createWindow();
 
   ipcMain.handle('vpn:connect', async (_, serverId, config) => {
+    const wgStatus = await ensureWireGuard();
+    if (!wgStatus.installed) {
+      return { success: false, error: wgStatus.error || 'WireGuard setup required. Please follow the installer.' };
+    }
     return await connectVPN(serverId, config);
   });
 
@@ -158,7 +237,11 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('vpn:check-wireguard', () => {
-    return { installed: checkWireGuardInstalled() };
+    return { installed: isWireGuardInstalled() };
+  });
+
+  ipcMain.handle('vpn:setup-wireguard', async () => {
+    return await ensureWireGuard();
   });
 
   ipcMain.handle('app:minimize', () => {
@@ -194,9 +277,11 @@ app.on('before-quit', async () => {
   if (isConnected && currentConfigPath) {
     try {
       if (isWin) {
-        execSync(`"${getWgQuickPath()}" /uninstalltunnelservice "${path.basename(currentConfigPath, '.conf')}"`, { stdio: 'ignore' });
+        const wgPath = getWgPath();
+        if (wgPath) execSync(`"${wgPath}" /uninstalltunnelservice "${currentTunnelName}"`, { stdio: 'ignore' });
       } else {
-        execSync(`sudo ${getWgQuickPath()} down "${currentConfigPath}"`, { stdio: 'ignore' });
+        const wgPath = getWgPath();
+        if (wgPath) execSync(`sudo ${wgPath} down "${currentConfigPath}"`, { stdio: 'ignore' });
       }
     } catch {}
   }
